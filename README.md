@@ -100,47 +100,14 @@ SUPABASE_SERVICE_KEY=your-service-role-key
 
 The mock ZK server (`mock-zk-server.js`) sends test events to the webhook server:
 
+Add this to the env file:
+
 ```bash
 # Configure test environment
-TARGET_URL=http://localhost:3001/webhook/testgym
+TARGET_URL=http://localhost:PORT/webhook/testgym
 PUSH_HMAC_SECRET=test-secret-123
 PUSH_INTERVAL_MS=5000
 
 # Start mock server
 node mock-zk-server.js
 ```
-
-## Database Setup
-
-You'll need to set up database triggers for each gym schema to handle:
-- Member lookup and enrichment
-- Supabase Realtime broadcasting
-- Membership status calculations
-
-Example trigger (to be implemented in Phase 2):
-```sql
-CREATE TRIGGER attendance_realtime_trigger
-  AFTER INSERT ON gym_testgym.attendance_events
-  FOR EACH ROW
-  EXECUTE FUNCTION handle_attendance_event();
-```
-
-## Security
-
-- HMAC signature verification for all webhook requests
-- Gym-specific webhook secrets stored in database
-- Service role key for database operations
-- Request validation and sanitization
-
-## Deployment
-
-The server can be deployed as:
-- Node.js process with PM2
-- Docker container
-- Cloud service (Railway, Render, etc.)
-
-Make sure to:
-- Set production environment variables
-- Configure proper logging
-- Set up health checks
-- Configure reverse proxy if needed
