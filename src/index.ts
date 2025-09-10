@@ -45,8 +45,8 @@ interface ZKEvent {
   readerName: string;
   devName: string;
   event_id: string;
-  verify_mode: 'face' | 'finger' | 'card' | 'multi';
-  result: 'pass' | 'fail';
+  verify_mode: 'face' | 'fingerprint' | 'card' | 'multi';
+  result: 'granted' | 'denied';
   event_iso: string;
 }
 
@@ -80,9 +80,22 @@ function validateZKEvent(event: ZKEvent): boolean {
     event.event_iso &&
     event.result &&
     event.verify_mode &&
-    ['pass', 'fail'].includes(event.result) &&
-    ['face', 'finger', 'card', 'multi'].includes(event.verify_mode)
+    ['granted', 'denied'].includes(event.result) &&
+    ['face', 'fingerprint', 'card', 'multi'].includes(event.verify_mode)
   );
+}
+
+// Map ZK values to database values
+function mapZKToDatabase(event: ZKEvent) {
+  return {
+    event_id: event.event_id,
+    turnstile_id: parseInt(event.pin),
+    event_time: event.event_iso,
+    result: event.result === 'granted' ? 'pass' : 'fail',
+    verify_mode: event.verify_mode === 'fingerprint' ? 'finger' : event.verify_mode,
+    device_name: event.devName,
+    area_name: event.areaName
+  };
 }
 
 // Create Express app
@@ -100,6 +113,8 @@ app.get('/health', (_req, res) => {
 app.post('/webhook/:tenant', async (req, res) => {
   const tenant = req.params.tenant;
   const body = req.body.toString('utf8');
+
+  console.log('Received webhook request', tenant, body);
   
   logger.info({ tenant }, 'Received webhook request');
 
@@ -183,15 +198,7 @@ app.post('/webhook/:tenant', async (req, res) => {
         const { data: newEvent, error: insertError } = await supabase
           .schema(gym_schema)
           .from('attendance_events')
-          .insert({
-            event_id: event.event_id,
-            turnstile_id: parseInt(event.pin),
-            event_time: event.event_iso,
-            result: event.result,
-            verify_mode: event.verify_mode,
-            device_name: event.devName,
-            area_name: event.areaName
-          })
+          .insert(mapZKToDatabase(event))
           .select('id')
           .single();
 
