@@ -19,9 +19,17 @@ const PORT = Number(process.env['PORT'] || 3001);
 const SUPABASE_URL = mustGet('SUPABASE_URL');
 const SUPABASE_SERVICE_KEY = mustGet('SUPABASE_SERVICE_KEY');
 
-// Supabase client
+// Supabase client with optimized configuration
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { persistSession: false }
+  auth: { persistSession: false },
+  db: {
+    schema: 'public'
+  },
+  global: {
+    headers: {
+      'x-application-name': 'attendance-webhook'
+    }
+  }
 });
 
 function mustGet(key: string): string {
@@ -98,6 +106,59 @@ function mapZKToDatabase(event: ZKEvent) {
   };
 }
 
+// Fallback function for individual event processing
+async function processEventsIndividually(
+  validEvents: any[], 
+  gym_schema: string, 
+  processedEvents: any[], 
+  errors: string[]
+) {
+  for (const event of validEvents) {
+    try {
+      const { data: newEvent, error: insertError } = await supabase
+        .schema(gym_schema)
+        .from('attendance_events')
+        .insert(event)
+        .select('id')
+        .single();
+
+      if (insertError) {
+        // Handle unique constraint violation (duplicate event)
+        if (insertError.code === '23505') {
+          logger.debug({ event_id: event.event_id }, 'Event already processed (duplicate)');
+          processedEvents.push({
+            event_id: event.event_id,
+            status: 'duplicate',
+            message: 'Event already processed'
+          });
+          continue;
+        }
+        
+        // Handle other database errors
+        logger.error({ event_id: event.event_id, insertError }, 'Error inserting attendance event');
+        errors.push(`Failed to store event: ${event.event_id}`);
+        continue;
+      }
+
+      if (!newEvent) {
+        logger.error({ event_id: event.event_id }, 'No data returned from insert');
+        errors.push(`Failed to store event: ${event.event_id}`);
+        continue;
+      }
+
+      processedEvents.push({
+        event_id: event.event_id,
+        status: 'processed',
+        db_id: newEvent.id
+      });
+
+    } catch (error) {
+      logger.error({ event_id: event.event_id, error: String(error) }, 'Error processing event');
+      errors.push(`Error processing event ${event.event_id}: ${error}`);
+    }
+  }
+}
+
 // Create Express app
 const app = express();
 
@@ -113,10 +174,8 @@ app.get('/health', (_req, res) => {
 app.post('/webhook/:tenant', async (req, res) => {
   const tenant = req.params.tenant;
   const body = req.body.toString('utf8');
-
-  console.log('Received webhook request', tenant, body);
   
-  logger.info({ tenant }, 'Received webhook request');
+  logger.info({ tenant, bodyLength: body.length }, 'Received webhook request');
 
   try {
     // Verify HMAC signature
@@ -166,63 +225,44 @@ app.post('/webhook/:tenant', async (req, res) => {
     const processedEvents: Array<{ event_id: string; status: string; message?: string; db_id?: number }> = [];
     const errors: string[] = [];
 
-    // Process each event
+    // Validate and prepare events for batch processing
+    const validEvents = [];
     for (const event of payload.data) {
-      try {
-        // Validate event data
-        if (!validateZKEvent(event)) {
-          logger.warn({ event_id: event.event_id }, 'Invalid event data');
-          errors.push(`Invalid event data for event_id: ${event.event_id}`);
-          continue;
-        }
+      if (!validateZKEvent(event)) {
+        logger.warn({ event_id: event.event_id }, 'Invalid event data');
+        errors.push(`Invalid event data for event_id: ${event.event_id}`);
+        continue;
+      }
+      validEvents.push(mapZKToDatabase(event));
+    }
 
-        // Store raw attendance event (database trigger will handle the rest)
-        const { data: newEvent, error: insertError } = await supabase
+    // Batch insert all valid events
+    if (validEvents.length > 0) {
+      try {
+        const { data: newEvents, error: insertError } = await supabase
           .schema(gym_schema)
           .from('attendance_events')
-          .insert(mapZKToDatabase(event))
-          .select('id')
-          .single();
+          .insert(validEvents)
+          .select('id, event_id');
 
         if (insertError) {
-          // Handle unique constraint violation (duplicate event)
-          if (insertError.code === '23505') {
-            logger.debug({ event_id: event.event_id }, 'Event already processed (duplicate)');
+          // If batch insert fails, fall back to individual inserts
+          logger.warn({ insertError }, 'Batch insert failed, falling back to individual inserts');
+          await processEventsIndividually(validEvents, gym_schema, processedEvents, errors);
+        } else if (newEvents) {
+          // All events inserted successfully
+          for (const newEvent of newEvents) {
             processedEvents.push({
-              event_id: event.event_id,
-              status: 'duplicate',
-              message: 'Event already processed'
+              event_id: newEvent.event_id,
+              status: 'processed',
+              db_id: newEvent.id
             });
-            continue;
           }
-          
-          // Handle other database errors
-          logger.error({ event_id: event.event_id, insertError }, 'Error inserting attendance event');
-          errors.push(`Failed to store event: ${event.event_id}`);
-          continue;
+          logger.debug({ count: newEvents.length }, 'Successfully batch inserted events');
         }
-
-        if (!newEvent) {
-          logger.error({ event_id: event.event_id }, 'No data returned from insert');
-          errors.push(`Failed to store event: ${event.event_id}`);
-          continue;
-        }
-
-        processedEvents.push({
-          event_id: event.event_id,
-          status: 'processed',
-          db_id: newEvent.id
-        });
-
-        logger.debug({ 
-          event_id: event.event_id, 
-          turnstile_id: event.pin,
-          db_id: newEvent.id 
-        }, 'Successfully inserted attendance event');
-
       } catch (error) {
-        logger.error({ event_id: event.event_id, error: String(error) }, 'Error processing event');
-        errors.push(`Error processing event ${event.event_id}: ${error}`);
+        logger.error({ error: String(error) }, 'Error in batch processing, falling back to individual inserts');
+        await processEventsIndividually(validEvents, gym_schema, processedEvents, errors);
       }
     }
 
