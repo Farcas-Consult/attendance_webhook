@@ -46,7 +46,7 @@ interface ZKEvent {
   devName: string;
   event_id: string;
   verify_mode: 'face' | 'fingerprint' | 'card' | 'multi';
-  result: 'granted' | 'denied';
+  result: 'granted' | 'denied' | 'pass' | 'fail';
   event_iso: string;
 }
 
@@ -80,7 +80,7 @@ function validateZKEvent(event: ZKEvent): boolean {
     event.event_iso &&
     event.result &&
     event.verify_mode &&
-    ['granted', 'denied'].includes(event.result) &&
+    ['granted', 'denied', 'pass', 'fail'].includes(event.result) &&
     ['face', 'fingerprint', 'card', 'multi'].includes(event.verify_mode)
   );
 }
@@ -91,7 +91,7 @@ function mapZKToDatabase(event: ZKEvent) {
     event_id: event.event_id,
     turnstile_id: parseInt(event.pin),
     event_time: event.event_iso,
-    result: event.result === 'granted' ? 'pass' : 'fail',
+    result: (event.result === 'granted' || event.result === 'pass') ? 'pass' : 'fail',
     verify_mode: event.verify_mode === 'fingerprint' ? 'finger' : event.verify_mode,
     device_name: event.devName,
     area_name: event.areaName

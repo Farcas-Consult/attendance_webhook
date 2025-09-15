@@ -70,8 +70,8 @@ let mockTransactions = [
   }
 ];
 
-const TARGET_URL = process.env.TARGET_URL || 'http://localhost:3005/webhook/demo';
-const PUSH_HMAC_SECRET = process.env.PUSH_HMAC_SECRET || 'demowebhook';
+const TARGET_URL = process.env.TARGET_URL || 'http://localhost:3005/webhook/empire';
+const PUSH_HMAC_SECRET = process.env.PUSH_HMAC_SECRET || 'empirewebhook2023kz';
 const PUSH_INTERVAL_MS = Number(process.env.PUSH_INTERVAL_MS || 10000);
 
 function chooseRandomSubset(items) {
