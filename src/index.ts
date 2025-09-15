@@ -176,24 +176,6 @@ app.post('/webhook/:tenant', async (req, res) => {
           continue;
         }
 
-        // Check if event already exists (idempotency)
-        const { data: existingEvent } = await supabase
-          .schema(gym_schema)
-          .from('attendance_events')
-          .select('id')
-          .eq('event_id', event.event_id)
-          .single();
-
-        if (existingEvent) {
-          logger.debug({ event_id: event.event_id }, 'Event already processed');
-          processedEvents.push({
-            event_id: event.event_id,
-            status: 'duplicate',
-            message: 'Event already processed'
-          });
-          continue;
-        }
-
         // Store raw attendance event (database trigger will handle the rest)
         const { data: newEvent, error: insertError } = await supabase
           .schema(gym_schema)
@@ -202,8 +184,26 @@ app.post('/webhook/:tenant', async (req, res) => {
           .select('id')
           .single();
 
-        if (insertError || !newEvent) {
+        if (insertError) {
+          // Handle unique constraint violation (duplicate event)
+          if (insertError.code === '23505') {
+            logger.debug({ event_id: event.event_id }, 'Event already processed (duplicate)');
+            processedEvents.push({
+              event_id: event.event_id,
+              status: 'duplicate',
+              message: 'Event already processed'
+            });
+            continue;
+          }
+          
+          // Handle other database errors
           logger.error({ event_id: event.event_id, insertError }, 'Error inserting attendance event');
+          errors.push(`Failed to store event: ${event.event_id}`);
+          continue;
+        }
+
+        if (!newEvent) {
+          logger.error({ event_id: event.event_id }, 'No data returned from insert');
           errors.push(`Failed to store event: ${event.event_id}`);
           continue;
         }
