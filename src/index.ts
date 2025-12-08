@@ -94,7 +94,7 @@ function validateZKEvent(event: ZKEvent): boolean {
 }
 
 // Map ZK values to database values
-function mapZKToDatabase(event: ZKEvent) {
+function mapZKToDatabase(event: ZKEvent, branchId: string) {
   return {
     event_id: event.event_id,
     turnstile_id: parseInt(event.pin),
@@ -102,7 +102,8 @@ function mapZKToDatabase(event: ZKEvent) {
     result: (event.result === 'granted' || event.result === 'pass') ? 'pass' : 'fail',
     verify_mode: (event.verify_mode === 'fingerprint' || event.verify_mode === 'finger') ? 'finger' : event.verify_mode,
     device_name: event.devName,
-    area_name: event.areaName
+    area_name: event.areaName,
+    branch_id: branchId
   };
 }
 
@@ -173,11 +174,18 @@ app.get('/health', (_req, res) => {
 // Main webhook endpoint
 app.post('/webhook/:tenant', async (req, res) => {
   const tenant = req.params.tenant;
+  const branchId = req.query.branch_id as string | undefined;
   const body = req.body.toString('utf8');
   
-  logger.info({ tenant, bodyLength: body.length }, 'Received webhook request');
+  logger.info({ tenant, branchId, bodyLength: body.length }, 'Received webhook request');
 
   try {
+    // Validate branch_id is provided
+    if (!branchId || branchId.trim() === '') {
+      logger.error({ tenant }, 'Missing required branch_id query parameter');
+      return res.status(400).json({ error: 'Missing required query parameter: branch_id' });
+    }
+
     // Verify HMAC signature
     const signature = req.headers['x-signature'] as string;
     if (!signature) {
@@ -233,7 +241,7 @@ app.post('/webhook/:tenant', async (req, res) => {
         errors.push(`Invalid event data for event_id: ${event.event_id}`);
         continue;
       }
-      validEvents.push(mapZKToDatabase(event));
+      validEvents.push(mapZKToDatabase(event, branchId));
     }
 
     // Batch insert all valid events
