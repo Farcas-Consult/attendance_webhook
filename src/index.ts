@@ -219,8 +219,9 @@ function validateHikEvent(event: HikEvent): boolean {
 
 function mapHikToDatabase(event: HikEvent, branchId: string): AttendanceEventInsert {
   const verifyMode = HIK_VERIFY_MODE_BY_EVENT_TYPE[event.eventType] || 'card';
-  // Hardware id for the access point — not personId/personCode (those are member identifiers in Hik).
+  // Site convention: map member `personCode` into `turnstile_id` (same role as ZK `pin`).
   const turnstileId =
+    toSafeInteger(event.data?.personCode) ??
     toSafeInteger(event.data?.readerIndexCode) ??
     toSafeInteger(event.srcIndex);
 
