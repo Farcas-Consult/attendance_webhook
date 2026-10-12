@@ -51,7 +51,6 @@ Process ZKTeco attendance events for a specific gym tenant.
   "data": [
     {
       "eventTime": "2025-01-15 10:30:15",
-      "event_iso": "2025-01-15T10:30:15Z",
       "event_id": "evt_1001_1736937015",
       "pin": "1001",
       "areaName": "Main Gym",
@@ -78,6 +77,8 @@ Process ZKTeco attendance events for a specific gym tenant.
   "errors": 0
 }
 ```
+
+`eventTime` is the ZKBio server's local wall-clock time with no offset. It is converted to UTC using the gym's `gyms.timezone` (e.g. `Africa/Nairobi`) before being stored as `event_time`. Any `event_iso` field sent by older collectors is ignored.
 
 Repeat scans by the same member within `REPEAT_SCAN_WINDOW_MINUTES` (default 10) of an already stored or earlier event are dropped and counted in `skipped_repeats`. Set it to `0` to disable.
 

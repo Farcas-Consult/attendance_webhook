@@ -42,6 +42,7 @@ function mustGet(key: string): string {
 
 // ZK Event interfaces 
 interface ZKEvent {
+  // Wall-clock time of the ZKBio server ("YYYY-MM-DD HH:mm:ss"), with no offset.
   eventTime: string;
   pin: string;
   areaName: string;
@@ -55,7 +56,6 @@ interface ZKEvent {
   event_id: string;
   verify_mode: 'face' | 'fingerprint' | 'finger' | 'card' | 'multi';
   result: 'granted' | 'denied' | 'pass' | 'fail';
-  event_iso: string;
 }
 
 interface ZKWebhookPayload {
@@ -123,6 +123,7 @@ interface EventProcessingResult {
 
 interface GymSecretRecord {
   gym_id: string;
+  timezone: string;
   zk_webhook_secret?: string | null;
 }
 
@@ -197,12 +198,55 @@ function toSafeInteger(value: string | number | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+const LOCAL_DATE_TIME_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/;
+
+function timeZoneOffsetMs(instantMs: number, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(new Date(instantMs));
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((entry) => entry.type === type)?.value);
+  const wallClockMs = Date.UTC(
+    part('year'),
+    part('month') - 1,
+    part('day'),
+    part('hour'),
+    part('minute'),
+    part('second')
+  );
+  return wallClockMs - instantMs;
+}
+
+/** Convert a wall-clock "YYYY-MM-DD HH:mm:ss" in `timeZone` to a UTC ISO string. */
+function localDateTimeToIso(localDateTime: string, timeZone: string): string | null {
+  const match = LOCAL_DATE_TIME_PATTERN.exec(localDateTime.trim());
+  if (!match) {
+    return null;
+  }
+
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number) as [
+    number, number, number, number, number, number
+  ];
+  const wallClockAsUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  // Second pass settles the offset when the first guess lands across a DST change.
+  const firstGuessMs = wallClockAsUtcMs - timeZoneOffsetMs(wallClockAsUtcMs, timeZone);
+  const instantMs = wallClockAsUtcMs - timeZoneOffsetMs(firstGuessMs, timeZone);
+  return new Date(instantMs).toISOString();
+}
+
 // Validate ZK event data 
 function validateZKEvent(event: ZKEvent): boolean {
   return !!(
     event.event_id &&
     event.pin &&
-    event.event_iso &&
+    event.eventTime &&
     event.result &&
     event.verify_mode &&
     ['granted', 'denied', 'pass', 'fail'].includes(event.result) &&
@@ -211,11 +255,11 @@ function validateZKEvent(event: ZKEvent): boolean {
 }
 
 // Map ZK values to database values
-function mapZKToDatabase(event: ZKEvent, branchId: string): AttendanceEventInsert {
+function mapZKToDatabase(event: ZKEvent, branchId: string, eventTime: string): AttendanceEventInsert {
   return {
     event_id: event.event_id,
     turnstile_id: toSafeInteger(event.pin),
-    event_time: event.event_iso,
+    event_time: eventTime,
     result: (event.result === 'granted' || event.result === 'pass') ? 'pass' : 'fail',
     verify_mode: (event.verify_mode === 'fingerprint' || event.verify_mode === 'finger') ? 'finger' : event.verify_mode,
     device_name: event.devName || null,
@@ -279,10 +323,10 @@ function getBranchId(branchId: string | undefined): string | null {
 async function getGymProviderSecret(
   tenant: string,
   secretColumn: GymSecretColumn
-): Promise<{ gymId: string; secret: string } | null> {
+): Promise<{ gymId: string; secret: string; timeZone: string } | null> {
   const { data, error } = await supabase
     .from('gyms')
-    .select(`gym_id, ${secretColumn}`)
+    .select(`gym_id, timezone, ${secretColumn}`)
     .eq('subdomain', tenant)
     .single();
 
@@ -298,7 +342,7 @@ async function getGymProviderSecret(
     return null;
   }
 
-  return { gymId: gym.gym_id, secret };
+  return { gymId: gym.gym_id, secret, timeZone: gym.timezone };
 }
 
 /** Resolve tenant for HikCentral: no webhook secret column required; Hik push does not send auth. */
@@ -657,7 +701,12 @@ app.post('/webhook/:tenant', async (req, res) => {
         logger.warn({ event_id: event.event_id }, 'Invalid event data');
         continue;
       }
-      validEvents.push(mapZKToDatabase(event, branchId));
+      const eventTime = localDateTimeToIso(event.eventTime, gymConfig.timeZone);
+      if (!eventTime) {
+        logger.warn({ event_id: event.event_id, eventTime: event.eventTime }, 'Invalid event time');
+        continue;
+      }
+      validEvents.push(mapZKToDatabase(event, branchId, eventTime));
     }
 
     const processingResult = await insertAttendanceEvents(validEvents, gymSchema);

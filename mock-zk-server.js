@@ -6,7 +6,6 @@ import crypto from 'crypto';
 let mockTransactions = [
   {
     eventTime: "2025-01-15 10:30:15",
-    event_iso: "2025-01-15T10:30:15Z",
     event_id: "evt_1001_1736937015",
     pin: "1001",
     areaName: "Main Gym",
@@ -22,7 +21,6 @@ let mockTransactions = [
   },
   {
     eventTime: "2025-01-15 10:32:20",
-    event_iso: "2025-01-15T10:32:20Z",
     event_id: "evt_1002_1736937140",
     pin: "1002",
     areaName: "Main Gym",
@@ -38,7 +36,6 @@ let mockTransactions = [
   },
   {
     eventTime: "2025-01-15 10:35:05",
-    event_iso: "2025-01-15T10:35:05Z",
     event_id: "evt_1003_1736937305",
     pin: "1003",
     areaName: "Free Weights",
@@ -54,7 +51,6 @@ let mockTransactions = [
   },
   {
     eventTime: "2025-01-15 10:36:40",
-    event_iso: "2025-01-15T10:36:40Z",
     event_id: "evt_1004_1736937400",
     pin: "1004",
     areaName: "Main Gym",
