@@ -117,6 +117,8 @@ interface ProcessedEventResult {
 interface EventProcessingResult {
   processedEvents: ProcessedEventResult[];
   errors: string[];
+  skippedUnknown: number;
+  skippedRepeats: number;
 }
 
 interface GymSecretRecord {
@@ -129,6 +131,11 @@ const HIK_SUCCESS_EVENT_TYPES = parseIntegerList(
   process.env['HIK_SUCCESS_EVENT_TYPES'],
   DEFAULT_HIK_SUCCESS_EVENT_TYPES
 );
+
+const REPEAT_SCAN_WINDOW_MS = parseNonNegativeNumber(
+  process.env['REPEAT_SCAN_WINDOW_MINUTES'],
+  10
+) * 60_000;
 
 const HIK_VERIFY_MODE_BY_EVENT_TYPE: Record<number, AttendanceEventInsert['verify_mode']> = {
   196893: 'face',
@@ -166,6 +173,15 @@ function parseIntegerList(value: string | undefined, fallback: number[]): number
     .filter((entry) => Number.isFinite(entry));
 
   return parsed.length > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function toSafeInteger(value: string | number | undefined): number | null {
@@ -354,6 +370,134 @@ async function processEventsIndividually(
   }
 }
 
+/**
+ * Drop events whose turnstile_id does not belong to a member with a linked user,
+ * since the app would render them as "Unknown". Fails open if the lookup errors.
+ */
+async function filterKnownMemberEvents(
+  events: AttendanceEventInsert[],
+  gymSchema: string
+): Promise<{ knownEvents: AttendanceEventInsert[]; unknownEvents: AttendanceEventInsert[] }> {
+  const turnstileIds = [
+    ...new Set(
+      events
+        .map((event) => event.turnstile_id)
+        .filter((id): id is number => id !== null)
+    ),
+  ];
+
+  if (turnstileIds.length === 0) {
+    return { knownEvents: [], unknownEvents: events };
+  }
+
+  const { data, error } = await supabase
+    .schema(gymSchema)
+    .from('members')
+    .select('turnstile_id')
+    .in('turnstile_id', turnstileIds)
+    .not('user_id', 'is', null);
+
+  if (error || !data) {
+    logger.warn({ gymSchema, error }, 'Member lookup failed, keeping all events');
+    return { knownEvents: events, unknownEvents: [] };
+  }
+
+  const knownIds = new Set(data.map((row) => Number(row.turnstile_id)));
+  const knownEvents: AttendanceEventInsert[] = [];
+  const unknownEvents: AttendanceEventInsert[] = [];
+  for (const event of events) {
+    if (event.turnstile_id !== null && knownIds.has(event.turnstile_id)) {
+      knownEvents.push(event);
+    } else {
+      unknownEvents.push(event);
+    }
+  }
+
+  return { knownEvents, unknownEvents };
+}
+
+/**
+ * Drop scans for a member who already has an event (stored or earlier in this batch)
+ * within REPEAT_SCAN_WINDOW_MS. Only successful ('pass') scans count, and failed scans are
+ * never dropped. Fails open if the lookup errors.
+ */
+async function filterRepeatScans(
+  events: AttendanceEventInsert[],
+  gymSchema: string
+): Promise<{ keptEvents: AttendanceEventInsert[]; repeatEvents: AttendanceEventInsert[] }> {
+  if (REPEAT_SCAN_WINDOW_MS === 0 || events.length === 0) {
+    return { keptEvents: events, repeatEvents: [] };
+  }
+
+  const timed = events.map((event) => ({ event, time: Date.parse(event.event_time) }));
+  const validTimes = timed.map(({ time }) => time).filter((time) => Number.isFinite(time));
+  if (validTimes.length === 0) {
+    return { keptEvents: events, repeatEvents: [] };
+  }
+
+  const turnstileIds = [
+    ...new Set(
+      events
+        .map((event) => event.turnstile_id)
+        .filter((id): id is number => id !== null)
+    ),
+  ];
+  if (turnstileIds.length === 0) {
+    return { keptEvents: events, repeatEvents: [] };
+  }
+
+  const from = new Date(Math.min(...validTimes) - REPEAT_SCAN_WINDOW_MS).toISOString();
+  const to = new Date(Math.max(...validTimes) + REPEAT_SCAN_WINDOW_MS).toISOString();
+
+  const { data, error } = await supabase
+    .schema(gymSchema)
+    .from('attendance_events')
+    .select('turnstile_id, event_time, event_id')
+    .eq('result', 'pass')
+    .in('turnstile_id', turnstileIds)
+    .gte('event_time', from)
+    .lte('event_time', to);
+
+  if (error || !data) {
+    logger.warn({ gymSchema, error }, 'Recent event lookup failed, skipping repeat-scan filter');
+    return { keptEvents: events, repeatEvents: [] };
+  }
+
+  const seenScans = new Map<number, { time: number; eventId: string }[]>();
+  for (const row of data) {
+    const id = Number(row.turnstile_id);
+    const time = Date.parse(row.event_time);
+    if (Number.isFinite(time)) {
+      seenScans.set(id, [...(seenScans.get(id) ?? []), { time, eventId: String(row.event_id) }]);
+    }
+  }
+
+  const keptEvents: AttendanceEventInsert[] = [];
+  const repeatEvents: AttendanceEventInsert[] = [];
+  const orderOf = (time: number) => (Number.isFinite(time) ? time : 0);
+  timed.sort((a, b) => orderOf(a.time) - orderOf(b.time));
+  for (const { event, time } of timed) {
+    const id = event.turnstile_id;
+    if (id === null || !Number.isFinite(time) || event.result !== 'pass') {
+      keptEvents.push(event);
+      continue;
+    }
+    const scans = seenScans.get(id) ?? [];
+    // Same event_id is a re-send, not a repeat: let the insert path report it as a duplicate.
+    const isRepeat = scans.some(
+      (seen) => seen.eventId !== event.event_id && Math.abs(seen.time - time) < REPEAT_SCAN_WINDOW_MS
+    );
+    if (isRepeat) {
+      repeatEvents.push(event);
+      continue;
+    }
+    keptEvents.push(event);
+    seenScans.set(id, [...scans, { time, eventId: event.event_id }]);
+  }
+
+  return { keptEvents, repeatEvents };
+}
+
 async function insertAttendanceEvents(
   validEvents: AttendanceEventInsert[],
   gymSchema: string
@@ -362,20 +506,51 @@ async function insertAttendanceEvents(
   const errors: string[] = [];
 
   if (validEvents.length === 0) {
-    return { processedEvents, errors };
+    return { processedEvents, errors, skippedUnknown: 0, skippedRepeats: 0 };
+  }
+
+  const { knownEvents, unknownEvents } = await filterKnownMemberEvents(validEvents, gymSchema);
+  const skippedUnknown = unknownEvents.length;
+  if (skippedUnknown > 0) {
+    logger.info(
+      {
+        gymSchema,
+        count: skippedUnknown,
+        turnstileIds: [...new Set(unknownEvents.map((event) => event.turnstile_id))],
+      },
+      'Dropped events for unknown members'
+    );
+  }
+
+  const { keptEvents, repeatEvents } = await filterRepeatScans(knownEvents, gymSchema);
+  const skippedRepeats = repeatEvents.length;
+  if (skippedRepeats > 0) {
+    logger.info(
+      {
+        gymSchema,
+        count: skippedRepeats,
+        windowMinutes: REPEAT_SCAN_WINDOW_MS / 60_000,
+        turnstileIds: [...new Set(repeatEvents.map((event) => event.turnstile_id))],
+      },
+      'Dropped repeat scans within window'
+    );
+  }
+
+  if (keptEvents.length === 0) {
+    return { processedEvents, errors, skippedUnknown, skippedRepeats };
   }
 
   try {
     const { data: newEvents, error: insertError } = await supabase
       .schema(gymSchema)
       .from('attendance_events')
-      .insert(validEvents)
+      .insert(keptEvents)
       .select('id, event_id');
 
     if (insertError) {
       logger.warn({ insertError }, 'Batch insert failed, falling back to individual inserts');
-      await processEventsIndividually(validEvents, gymSchema, processedEvents, errors);
-      return { processedEvents, errors };
+      await processEventsIndividually(keptEvents, gymSchema, processedEvents, errors);
+      return { processedEvents, errors, skippedUnknown, skippedRepeats };
     }
 
     if (newEvents) {
@@ -390,10 +565,10 @@ async function insertAttendanceEvents(
     }
   } catch (error) {
     logger.error({ error: String(error) }, 'Error in batch processing, falling back to individual inserts');
-    await processEventsIndividually(validEvents, gymSchema, processedEvents, errors);
+    await processEventsIndividually(keptEvents, gymSchema, processedEvents, errors);
   }
 
-  return { processedEvents, errors };
+  return { processedEvents, errors, skippedUnknown, skippedRepeats };
 }
 
 function buildWebhookResponse(
@@ -409,6 +584,8 @@ function buildWebhookResponse(
     received,
     processed: processingResult.processedEvents.filter((event) => event.status === 'processed').length,
     duplicates: processingResult.processedEvents.filter((event) => event.status === 'duplicate').length,
+    skipped_unknown: processingResult.skippedUnknown,
+    skipped_repeats: processingResult.skippedRepeats,
     errors: processingResult.errors.length,
     error_details: processingResult.errors.length > 0 ? processingResult.errors : undefined
   };
